@@ -6,6 +6,7 @@
                        " USER PASS PASV PORT CD PWD LIST GET\n"
                        "214 Help OK."))
 (def login-successful "230 Login successful. ")
+(def transfer-complete "226 Transfer complete")
 (def enter-passive-mode "227 Passive mode entered. ")
 (def pathname-created "257 Pathname created. ")
 

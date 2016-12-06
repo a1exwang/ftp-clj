@@ -60,25 +60,54 @@
         [env path-does-not-exist]))
     [env wrong-state]))
 
-(defn list-dir [env words]
-  (if (not (= (count words) 1))
-    (throw (new Exception "FTP Syntax error")))
-  [env 
-   (str pathname-created 
-        (str/join " " (io/file (get env :ftp-root-path) (get env :cwd))))])
-
 (defn create-passive-mode-end-point []
-  ; (let [sock (new ServerSocket 0)
-  ;       port (.getPort sock)]
-  ;   (println (str "Passive socket is up at port " port))
-  ;   (new-client-connect (.accept server-socket)))
-  [127, 0, 0, 1, 100, 78])
+  (let [sock (new ServerSocket 0)
+        ipstr (.toString (.getInetAddress sock))
+        ip   [0 0 0 0]
+        port (.getLocalPort sock)]
+    (println (str "Passive socket is up at port " port))
+    [sock
+     (str/join "," (concat ip [(quot port 0x100) (bit-and port 0xff)]))]))
+
+(defn wait-for-data-client [env]
+  (merge env {:data-client-sock (.accept (get env :data-sock))}))
 
 (defn pasv [env words]
   (if (not (= (count words) 1))
     (throw (new Exception "FTP Syntax error")))
-  [env (str enter-passive-mode (create-passive-mode-end-point))])
+  (let [[sock end-point-str] (create-passive-mode-end-point)]
+    [(merge env {:state ftp-state-passive :data-sock sock})
+     (str enter-passive-mode "(" end-point-str ")")
+     wait-for-data-client]))
 
+(defn send-passive [env data]
+  (let [client-socket (get env :data-client-sock)
+        server-socket (get env :data-sock)
+        os (new DataOutputStream (.getOutputStream client-socket))]
+    (.writeBytes os data)
+    (.close os)
+    (.close client-socket)
+    (.close server-socket)))
+
+(defn list-dir [env words]
+  (if (not (= (count words) 1))
+    (throw (new Exception "FTP Syntax error")))
+  (if (= (get env :state ftp-state-passive))
+    (do
+      (let [result (str/join " " (.list (io/file (get env :ftp-root-path) (subs (get env :cwd) 1))))]
+        (send-passive env result)
+        [env (str pathname-created)]))
+    [env (str wrong-state)]))
+
+(defn retrieve-file [env words]
+  (if (not (= (count words) 2))
+    (throw (new Exception "FTP Syntax error")))
+  (if (= (get env :state ftp-state-passive))
+    (do
+      (let [f (io/file (get env :ftp-root-path) (subs (get env :cwd) 1) (get words 1))]
+        (send-passive env (slurp f))
+        [env (str transfer-complete)]))
+    [env (str wrong-state)]))
 
 (defn syntax-error [env words msg]
   (str wrong-command-or-parameter " " msg))

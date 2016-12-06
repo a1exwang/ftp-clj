@@ -3,7 +3,10 @@
 
 (import
   '(java.io BufferedReader InputStreamReader DataOutputStream)
-  '(java.net ServerSocket SocketException))
+  '(java.net ServerSocket SocketException)
+  '(java.nio.channels ServerSocketChannel)
+  )
+
 
 (use '[clojure.string :only [split lower-case trim]])
 (use '[ftp-clj.server.code])
@@ -26,9 +29,12 @@
             "pwd"   (pwd env words)
             "cwd"   (cwd env words)
             "pasv"  (pasv env words)
+            "retr"  (retrieve-file env words)
             "list"  (list-dir env words)))
         (catch Exception e 
-          [env (syntax-error env words (str e))])))))
+          (do
+            (.printStackTrace e)
+            [env (syntax-error env words (str e "\n"))]))))))
 
 (defn new-client-connect [client-socket]
   (try
@@ -38,11 +44,13 @@
       (loop [env (create-env)]
         (let [line (.readLine is)]
           (println (str "-->: " line))
-          (let [[new-env reply]
+          (let [[new-env reply callback]
                 (server-pi env (.toLowerCase line))]
             (.writeBytes os (str reply "\n"))
             (println (str "new-env:\n" new-env))
-            (recur new-env)))))
+            (if (= callback nil)
+              (recur new-env)
+              (recur (callback new-env)))))))
     (catch SocketException e
       (do
         (.close client-socket)
