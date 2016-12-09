@@ -1,4 +1,9 @@
-(ns ftp-clj.server.commands (:gen-class))
+(ns ftp-clj.server.commands
+  (:gen-class)
+  (:import (java.nio ByteBuffer)
+           (java.nio.charset Charset)
+           (java.net InetSocketAddress)
+           (java.nio.channels ServerSocketChannel SelectionKey)))
 
 (import
   '(java.io BufferedReader InputStreamReader DataOutputStream)
@@ -8,46 +13,57 @@
 (require '[clojure.java.io :as io])
 (require '[clojure.string :as str])
 
+(defn send-str [channel result]
+  (.write channel
+          (ByteBuffer/wrap (.getBytes (str result "\n") (Charset/forName "UTF-8")))))
+
+(defn send-raw [channel result]
+  (.write channel
+          (ByteBuffer/wrap (.getBytes result (Charset/forName "UTF-8")))))
+
 (def ftp-state-init "init")
 (def ftp-state-need-pass "need-pass")
 (def ftp-state-logged-in "logged-in")
 (def ftp-state-passive "passive")
+(def ftp-state-passive-connected "passive-connected")
+(def ftp-state-passive-wait-for-connection "passive-wait-for-connection")
 (def ftp-state-active "active")
 
-(defn help [env words]
-  (if (not (= (count words) 1))
-    (throw (new Exception "FTP Syntax error")))
-  [env help-message])
+(defn help [state env channel words]
+  (send-str channel help-message)
+  [state env])
+(defn syst [state env channel words]
+  (send-str channel system-type)
+  [state env])
+(defn feat [state env channel words]
+  (send-str channel server-features)
+  [state env])
+(defn transfer-type [state env channel words]
+  (send-str channel "200 Switching to binary mode.")
+  [state env])
+(defn mdtm [state env channel words]
+  (send-str channel "213 20161204191607")
+  [state env])
 
+(defn user [state env channel words]
+  (send-str channel user-name-ok-need-pass)
+  [ftp-state-need-pass
+   (merge env {:user (get words 1)})])
 
-(defn user [env words]
-  (if (not (= (count words) 2))
-    (throw (new Exception "FTP Syntax error")))
-  [(merge env 
-          {:user (get words 1)
-           :state ftp-state-need-pass})
-   user-name-ok-need-pass])
+(defn pass [state env channel words]
+  (send-str channel login-successful)
+  [ftp-state-logged-in
+   (merge env {:password (get words 1), :cwd "/"})])
 
-(defn pass [env words]
-  (if (not (= (count words) 2))
-    (throw (new Exception "FTP Syntax error")))
-  [(merge env
-          {:state ftp-state-logged-in
-           :password (get words 1)
-           :cwd "/"})
-   login-successful])
+(defn pwd [state env channel words]
+  (if (some (partial = state) [ftp-state-logged-in ftp-state-passive ftp-state-active])
+    (do
+      (send-str channel (str pathname-created "\"" (get env :cwd) "\" is current directory"))
+      [state env])
+    [state env]))
 
-(defn pwd [env words]
-  (if (not (= (count words) 1))
-    (throw (new Exception "FTP Syntax error")))
-  (if (some (partial = (get env :state)) [ftp-state-logged-in ftp-state-passive ftp-state-active])
-    [env (str pathname-created "\"" (get env :cwd) "\" is current directory")]
-    [env wrong-state]))
-
-(defn cwd [env words]
-  (if (not (= (count words) 2))
-    (throw (new Exception "FTP Syntax error")))
-  (if (= (get env :state) ftp-state-logged-in)
+(defn cwd [state env channel words]
+  (if (= state ftp-state-logged-in)
     (let [new-cwd
           (let [cwd (get env :cwd)
                 new-path (get words 1)]
@@ -55,59 +71,78 @@
               new-path 
               (.getPath (io/file cwd new-path))))]
       (if (.isDirectory (io/file (get env :ftp-root-path) (subs new-cwd 1)))
-        [(merge env {:cwd new-cwd})
-         (str pathname-created "\"" new-cwd "\" is current directory.")]
-        [env path-does-not-exist]))
-    [env wrong-state]))
 
-(defn create-passive-mode-end-point []
-  (let [sock (new ServerSocket 0)
-        ipstr (.toString (.getInetAddress sock))
-        ip   [0 0 0 0]
-        port (.getLocalPort sock)]
-    (println (str "Passive socket is up at port " port))
-    [sock
-     (str/join "," (concat ip [(quot port 0x100) (bit-and port 0xff)]))]))
+        (do
+          (send-str channel (str pathname-created "\"" new-cwd "\" is current directory."))
+          [state (merge env {:cwd new-cwd})])
+        (do
+          (send-str channel path-does-not-exist)
+          [state env])))
+    [state env]))
 
-(defn wait-for-data-client [env]
-  (merge env {:data-client-sock (.accept (get env :data-sock))}))
+(defn setup-data-server-sock []
+  (let [server-socket-channel (ServerSocketChannel/open)
+        _ (.configureBlocking server-socket-channel false)
+        server-socket (.socket server-socket-channel)
+        inet-socket-address (InetSocketAddress. 0)]
+    (.bind server-socket inet-socket-address)
 
-(defn pasv [env words]
-  (if (not (= (count words) 1))
-    (throw (new Exception "FTP Syntax error")))
-  (let [[sock end-point-str] (create-passive-mode-end-point)]
-    [(merge env {:state ftp-state-passive :data-sock sock})
-     (str enter-passive-mode "(" end-point-str ")")
-     wait-for-data-client]))
+    (let [port (.getLocalPort server-socket)
+          ip [0 0 0 0]
+          end-point-str
+          (str/join "," (concat ip [(quot port 0x100) (bit-and port 0xff)]))]
+    [server-socket-channel port end-point-str])))
+
+(defn pasv [state env channel selector words]
+  (if (not (= state ftp-state-logged-in))
+    (do
+      (println "PASV: state != logged in but \"" state "\"")
+      (send-str channel (str wrong-state "Cannot use command PASV"))
+      [state env])
+    (let [[server-channel port end-point-str] (setup-data-server-sock)]
+      (.register server-channel selector SelectionKey/OP_ACCEPT "data-server-socket")
+      (println "Data socket is up at port " port)
+      (send-str channel (str enter-passive-mode "(" end-point-str ")"))
+      [ftp-state-passive
+       (merge env {:data-server-channel server-channel})])))
 
 (defn send-passive [env data]
-  (let [client-socket (get env :data-client-sock)
-        server-socket (get env :data-sock)
-        os (new DataOutputStream (.getOutputStream client-socket))]
-    (.writeBytes os data)
-    (.close os)
-    (.close client-socket)
-    (.close server-socket)))
+  (let [channel (get env :data-client-channel)]
+    (send-raw channel data)
+    (.close channel)))
 
-(defn list-dir [env words]
-  (if (not (= (count words) 1))
-    (throw (new Exception "FTP Syntax error")))
-  (if (= (get env :state ftp-state-passive))
+(defn create-list-dir-info [parent-dir file-name]
+  (let [f (io/file parent-dir file-name)
+        privs (if (.isDirectory f) "drwxrwxrwx" "-rwxrwxrwx")
+        user-n 0
+        group-n 0
+        inode-n 0
+        date-str "Dec 9 2016"
+        size-n (.length f)]
+    (str/join " " [privs inode-n user-n group-n size-n date-str file-name "\n"])))
+
+(defn list-dir [state env channel words]
+  (if (not (= state ftp-state-passive-connected))
     (do
-      (let [result (str/join " " (.list (io/file (get env :ftp-root-path) (subs (get env :cwd) 1))))]
+      (send-str channel (str wrong-state "Cannot use command LIST"))
+      [state env])
+    (do
+      (let [parent-dir (io/file (get env :ftp-root-path) (subs (get env :cwd) 1))
+            result (str/join "\n" (map (partial create-list-dir-info parent-dir) (.list parent-dir)))]
         (send-passive env result)
-        [env (str pathname-created)]))
-    [env (str wrong-state)]))
+        (send-str channel (str pathname-created))
+        [ftp-state-logged-in
+         (merge env {:data-client-channel nil})]))))
 
-(defn retrieve-file [env words]
-  (if (not (= (count words) 2))
-    (throw (new Exception "FTP Syntax error")))
-  (if (= (get env :state ftp-state-passive))
+(defn retrieve-file [state env channel selector words]
+  (if (= state ftp-state-passive-connected)
     (do
       (let [f (io/file (get env :ftp-root-path) (subs (get env :cwd) 1) (get words 1))]
+        (send-str channel (str transfer-started))
         (send-passive env (slurp f))
-        [env (str transfer-complete)]))
-    [env (str wrong-state)]))
+        (send-str channel (str transfer-complete))
+        [ftp-state-logged-in env]))
+    [state env]))
 
 (defn syntax-error [env words msg]
   (str wrong-command-or-parameter " " msg))
