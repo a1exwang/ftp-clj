@@ -130,16 +130,33 @@
       (let [parent-dir (io/file (get env :ftp-root-path) (subs (get env :cwd) 1))
             result (str/join "\n" (map (partial create-list-dir-info parent-dir) (.list parent-dir)))]
         (send-passive env result)
-        (send-str channel (str pathname-created))
+        (send-str channel (str transfer-complete))
         [ftp-state-logged-in
          (merge env {:data-client-channel nil})]))))
+
+(def buffer-size 1500)
+
+(defn send-file [env file]
+  (let [channel (get env :data-client-channel)
+        is (io/input-stream file)]
+    (loop []
+      (let [buf (byte-array buffer-size)
+            read-count (.read is buf)]
+        (if (> read-count 0)
+          (do
+            (send-raw channel (String. buf 0 read-count (Charset/forName "UTF-8")))
+            (if (= read-count buffer-size)
+              (recur))))))
+    (.close is)
+    (.close channel)))
 
 (defn retrieve-file [state env channel selector words]
   (if (= state ftp-state-passive-connected)
     (do
       (let [f (io/file (get env :ftp-root-path) (subs (get env :cwd) 1) (get words 1))]
         (send-str channel (str transfer-started))
-        (send-passive env (slurp f))
+        ;(send-passive env (slurp f))
+        (send-file env f)
         (send-str channel (str transfer-complete))
         [ftp-state-logged-in env]))
     [state env]))
